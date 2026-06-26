@@ -1,151 +1,129 @@
 # Python-Flask-O-rta-daraja1
-Mana, Flask ilovangiz uchun berilgan barcha talablar asosida to'liq va xavfsiz RESTful API tizimini yaratish bo'yicha qo'llanma. Web UI bilan parallel ravishda ishlashi uchun barcha xatoliklar JSON formatida qaytariladi.
+Mana, Flask REST API uchun paginatsiya, filtrlash, qidiruv, saralash va dinamik maydonlarni tanlash (field selection) funksiyalarini o'z ichiga olgan to'liq va xavfsiz endpoint kodlari.
 
-1. API Blueprint va Marshrutlar (api.py)
-Barcha CRUD amallari, xavfsiz JSON parslash (silent=True), validatsiya va to'g'ri HTTP status kodlari bilan:
+1. API Endpoint Kodu (routes.py)
+Ushbu kod SQL injection'dan to'liq himoyalangan, so'rov parametrlarini xavfsiz tekshiradi (whitelist) va barcha talab qilingan meta-ma'lumotlar hamda havolalarni (links) shakllantiradi.
 
 Python
-import os
 from flask import Blueprint, jsonify, request, url_for
+from sqlalchemy import or_
 from models import db, Post  # Loyihangizdagi db va Post modeli
 
 api_bp = Blueprint('api', __name__, url_prefix='/api')
 
-# --- ERROR HANDLERS (JSON formatida) ---
-
-@api_bp.app_errorhandler(400)
-def bad_request(error):
-    return jsonify({'error': getattr(error, 'description', 'Bad Request')}), 400
-
-@api_bp.app_errorhandler(404)
-def not_found(error):
-    return jsonify({'error': 'Resource not found'}), 404
-
-@api_bp.app_errorhandler(500)
-def internal_server_error(error):
-    return jsonify({'error': 'Internal server error'}), 500
-
-
-# --- ENDPOINTS ---
-
 @api_bp.route('/posts', methods=['GET'])
 def get_posts():
-    """Barcha postlarni qaytarish (200)"""
-    posts = Post.query.all()
-    return jsonify([post.to_dict() for post in posts]), 200
+    # 1. Paginatsiya parametrlarini olish va tekshirish
+    try:
+        page = request.args.get('page', default=1, type=int)
+        per_page = request.args.get('per_page', default=20, type=int)
+        if page < 1: page = 1
+        # Maksimal 50 ta cheklovi
+        if per_page > 50: per_page = 50
+        if per_page < 1: per_page = 20
+    except ValueError:
+        page, per_page = 1, 20
 
+    # Base query yaratish
+    query = Post.query
 
-@api_bp.route('/posts/<int:post_id>', methods=['GET'])
-def get_post(post_id):
-    """Bitta postni qaytarish (200) yoki 404"""
-    post = Post.query.get_or_404(post_id)
-    return jsonify(post.to_dict()), 200
+    # 2. ?q= parametr bo'yicha qidiruv (title va body bo'yicha or_ + ilike)
+    search_query = request.args.get('q', default='', type=str).strip()
+    if search_query:
+        search_fmt = f"%{search_query}%"
+        query = query.filter(or_(
+            Post.title.ilike(search_fmt),
+            Post.body.ilike(search_fmt)  # Agar modelda content bo'lsa, Post.content deb o'zgartiring
+        ))
 
+    # 3. Saralash (Whitelist tekshiruvi - SQL Injection'dan himoya)
+    sort_by = request.args.get('sort', default='created_at', type=str).lower()
+    order = request.args.get('order', default='desc', type=str).lower()
 
-@api_bp.route('/posts', methods=['POST'])
-def create_post():
-    """Yangi post yaratish (201) + Location header"""
-    data = request.get_json(silent=True)
+    # Ruxsat etilgan maydonlar ro'yxati
+    allowed_sort_fields = {
+        'id': Post.id,
+        'title': Post.title,
+        'created_at': Post.created_at
+    }
+
+    # Whitelist tekshiruvi
+    sort_column = allowed_sort_fields.get(sort_by, Post.created_at)
     
-    # JSON mavjudligi va validatsiya
-    if not data or 'title' not in data or not data['title'].strip():
-        return jsonify({'error': 'title required'}), 400
-        
-    new_post = Post(
-        title=data['title'].strip(),
-        content=data.get('content', '').strip()
-    )
-    db.session.add(new_post)
-    db.session.commit()
-    
-    response = jsonify(new_post.to_dict())
-    response.headers['Location'] = url_for('api.get_post', post_id=new_post.id, _external=True)
-    return response, 201
+    if order == 'asc':
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
 
+    # 4. Paginatsiyani amalga oshirish (Flask-SQLAlchemy paginate metodi)
+    pagination = query.paginate(page=page, per_page=per_page, error_out=False)
 
-@api_bp.route('/posts/<int:post_id>', methods=['PUT'])
-def update_post(post_id):
-    """Postni yangilash (200)"""
-    post = Post.query.get_or_404(post_id)
-    data = request.get_json(silent=True)
-    
-    if not data:
-        return jsonify({'error': 'Invalid JSON'}), 400
-        
-    if 'title' in data:
-        if not data['title'].strip():
-            return jsonify({'error': 'title required'}), 400
-        post.title = data['title'].strip()
-        
-    if 'content' in data:
-        post.content = data['content'].strip()
-        
-    db.session.commit()
-    return jsonify(post.to_dict()), 200
+    # 5. Bonus: Field Selection (?fields=id,title)
+    fields_arg = request.args.get('fields', default='', type=str)
+    requested_fields = [f.strip() for f in fields_arg.split(',') if f.strip()] if fields_arg else []
 
+    items = []
+    for post in pagination.items:
+        # Agar field selection bo'sh bo'lsa, standart dict qaytadi
+        full_dict = post.to_dict() 
+        if requested_fields:
+            # Faqat so'ralgan maydonlarni saralab olish
+            filtered_dict = {k: v for k, v in full_dict.items() if k in requested_fields}
+            items.append(filtered_dict)
+        else:
+            items.append(full_dict)
 
-@api_bp.route('/posts/<int:post_id>', methods=['DELETE'])
-def delete_post(post_id):
-    """Postni o'chirish (204)"""
-    post = Post.query.get_or_404(post_id)
-    db.session.delete(post)
-    db.session.commit()
-    return '', 204
-Eslatma: Post modelingizda ma'lumotlarni dict ko'rinishiga o'tkazuvchi to_dict() metodi bo'lishi kerak. Masalan:
+    # 6. To'liq tashqi URL (links) hosil qilish funksiyasi (_external=True)
+    def get_page_link(p_num):
+        if p_num is None:
+            return None
+        # Mavjud query parametrlarni saqlab qolgan holda URL hosil qilish
+        args = request.args.to_dict()
+        args['page'] = p_num
+        args['per_page'] = per_page
+        return url_for('api.get_posts', _external=True, **args)
 
-Python
-def to_dict(self):
-    return {'id': self.id, 'title': self.title, 'content': self.content}
-2. API'ni ro'yxatdan o'tkazish (app.py)
-Web UI va API parallel ishlashi uchun Blueprint'ni asosiy ilovaga ulaymiz:
+    # Natija tuzilishi
+    response_data = {
+        'items': items,
+        'meta': {
+            'page': pagination.page,
+            'per_page': pagination.per_page,
+            'total': pagination.total,
+            'pages': pagination.pages,
+            'has_next': pagination.has_next,
+            'has_prev': pagination.has_prev
+        },
+        'links': {
+            'self': get_page_link(pagination.page),
+            'next': get_page_link(pagination.next_num) if pagination.has_next else None,
+            'prev': get_page_link(pagination.prev_num) if pagination.has_prev else None
+        }
+    }
 
-Python
-from flask import Flask
-from models import db
-from api import api_bp
-# UI uchun blueprint'ni ham import qilishingiz mumkin (masalan: from web import web_bp)
-
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///posts.db'
-db.init_app(app)
-
-# API blueprint'ini ulash
-app.register_blueprint(api_bp)
-
-# Web UI blueprint'ini ulash (U ham o'z yo'lida ishlayveradi)
-# app.register_blueprint(web_bp)
-
-if __name__ == '__main__':
-    app.run(debug=True)
-3. README.md uchun curl qo'llanmasi
-Loyiha hujjatlariga quyidagi qismni qo'shishingiz mumkin:
+    return jsonify(response_data), 200
+2. To'liq cURL misollari (README.md uchun)
+Loyiha hujjatlariga quyidagi batafsil cURL buyruqlarini qo'shishingiz mumkin:
 
 Markdown
-## API Endpoint'lar bo'yicha qo'llanma (cURL)
+### 1. Barcha parametrlar ishtirok etgan to'liq cURL so'rovi
+Ushbu so'rov `flask` so'zi bo'yicha qidiradi, natijalarni `title` bo'yicha `asc` (o'sish) tartibida saralaydi, sahifada 5 tadan ko'rsatib, 2-sahifani oladi hamda faqat `id` va `title` maydonlarini qaytaradi:
 
-Asosiy URL: `http://127.0.0.1:5000/api`
-
-### 1. Barcha postlarni olish
 ```bash
-curl -X GET [http://127.0.0.1:5000/api/posts](http://127.0.0.1:5000/api/posts)
-2. ID bo'yicha bitta postni olish
+curl -G "[http://127.0.0.1:5000/api/posts](http://127.0.0.1:5000/api/posts)" \
+     --data-urlencode "q=flask" \
+     --data-urlencode "page=2" \
+     --data-urlencode "per_page=5" \
+     --data-urlencode "sort=title" \
+     --data-urlencode "order=asc" \
+     --data-urlencode "fields=id,title"
+2. Standart (Default) so'rov
+Parametrlarsiz yuborilganda page=1, per_page=20, sort=created_at, order=desc qiymatlari avtomatik ishlaydi:
+
 Bash
-curl -X GET [http://127.0.0.1:5000/api/posts/1](http://127.0.0.1:5000/api/posts/1)
-3. Yangi post yaratish
+curl -X GET "[http://127.0.0.1:5000/api/posts](http://127.0.0.1:5000/api/posts)"
+3. Faqat qidiruv va maydonlarni cheklash (Field Selection)
 Bash
-curl -X POST [http://127.0.0.1:5000/api/posts](http://127.0.0.1:5000/api/posts) \
-     -H "Content-Type: application/json" \
-     -d '{"title": "Yangi Post", "content": "Post matni shu yerda"}'
-4. Xatolik testi (Title berilmaganda 400 Bad Request)
-Bash
-curl -X POST [http://127.0.0.1:5000/api/posts](http://127.0.0.1:5000/api/posts) \
-     -H "Content-Type: application/json" \
-     -d '{"content": "Sarlavhasiz post"}'
-5. Postni yangilash
-Bash
-curl -X PUT [http://127.0.0.1:5000/api/posts/1](http://127.0.0.1:5000/api/posts/1) \
-     -H "Content-Type: application/json" \
-     -d '{"title": "Yangilangan sarlavha"}'
-6. Postni o'chirish
-Bash
-curl -X DELETE [http://127.0.0.1:5000/api/posts/1](http://127.0.0.1:5000/api/posts/1)
+curl -G "[http://127.0.0.1:5000/api/posts](http://127.0.0.1:5000/api/posts)" \
+     --data-urlencode "q=python" \
+     --data-urlencode "fields=id,title,created_at"
