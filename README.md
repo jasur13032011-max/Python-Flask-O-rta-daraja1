@@ -1,104 +1,153 @@
 # Python-Flask-O-rta-daraja1
-Keling, ushbu qadamlarning barchasini o'z ichiga olgan to'liq va tayyor kod strukturasini ko'rib chiqamiz. Parollarni xeshlash uchun Flask-da standart bo'lgan Werkzeug kutubxonasidan foydalanamiz.
+Flask-Login kutubxonasi yordamida autentifikatsiya tizimini to'liq yakunlash uchun quyidagi o'zgarishlar va yangi marshrutlarni (routes) qo'shishingiz kerak.
 
-1. Model va Metodlar (models.py)
-Foydalanuvchi modeliga password_hash ustunini qo'shamiz hamda parolni o'rnatish va tekshirish metodlarini yozamiz:
+1. Modelga UserMixin qo'shish va Login Manager (models.py & extensions.py)
+UserMixin foydalanuvchi modeliga Flask-Login uchun kerakli bo'lgan xususiyatlarni (is_authenticated, is_active va h.k.) avtomat qo'shadi.
 
 Python
 from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin, LoginManager
 from werkzeug.security import generate_password_hash, check_password_hash
 
 db = SQLAlchemy()
+login_manager = LoginManager()
+# Login talab qilinadigan sahifaga ruxsatsiz kirilganda yo'naltiriladigan manzil
+login_manager.login_view = 'auth.login'
+login_manager.login_message_category = 'info'
 
-class User(db.Model):
+@login_manager.user_loader
+def load_user(user_id):
+    """Sessiyadagi foydalanuvchini ID orqali bazadan yuklab olish"""
+    return User.query.get(int(user_id))
+
+class User(db.Model, UserMixin): # UserMixin meros olindi
     __tablename__ = 'users'
     
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    # Xesh uchun 255 belgi uzunlikdagi ustun
     password_hash = db.Column(db.String(255), nullable=False)
+    
+    # Item modeli bilan aloqa (Relationship)
+    items = db.relationship('Item', backref='author', lazy=True)
 
     def set_password(self, raw_password):
-        """Xom parolni xeshga o'girib saqlaydi"""
         self.password_hash = generate_password_hash(raw_password)
 
     def check_password(self, raw_password):
-        """Kiritilgan parolni xesh bilan solishtiradi"""
         return check_password_hash(self.password_hash, raw_password)
-2. Ma'lumotlar bazasi migratsiyasi (Flask-Migrate)
-Terminalda yangi ustunni bazaga qo'shish uchun quyidagi buyruqlarni ketma-ket bajaramiz:
 
-Bash
-# 1. Yangi ustun uchun migratsiya faylini yaratish
-flask db migrate -m "add password_hash to users"
-
-# 2. O'zgarishlarni ma'lumotlar bazasiga qo'llash
-flask db upgrade
-3. Register Controller va Validatsiya (routes.py)
-Ro'yxatdan o'tish formasi, validatsiya va xavfsizlik tekshiruvlari:
+class Item(db.Model):
+    __tablename__ = 'items'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    # Tashqi kalit (Foreign Key) foydalanuvchiga bog'lash uchun
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+2. Login va Logout Marshrutlari (auth.py)
+Login jarayonida foydalanuvchi ham username, ham email orqali kira olishi mantiqini yozamiz hamda ?next=... parametrini inobatga olamiz:
 
 Python
 from flask import Blueprint, render_template, request, redirect, url_for, flash
-from models import db, User
+from flask_login import login_user, logout_user, login_required, current_user
+from models import User, db
+from urllib.parse import urlparse
 
 auth = Blueprint('auth', __name__)
 
-@auth.route('/auth/register', methods=['GET', 'POST'])
-def register():
+@auth.route('/auth/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('main.index')) # Agar login bo'lgan bo'lsa, bosh sahifaga
+
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
-        email = request.form.get('email', '').strip()
+        login_input = request.form.get('login_input', '').strip() # username yoki email
         password = request.form.get('password', '')
+        remember = True if request.form.get('remember') else False
 
-        # 1. Validatsiya: Majburiy maydonlar va parol uzunligi
-        if not username or not email:
-            flash("Username va Email kiritilishi majburiy!", "danger")
-            return render_template('register.html'), 400
+        # Username Yoki Email bo'yicha qidirish
+        user = User.query.filter((User.username == login_input) | (User.email == login_input)).first()
+
+        if user and user.check_password(password):
+            login_user(user, remember=remember)
             
-        if len(password) < 8:
-            flash("Parol kamida 8 ta belgidan iborat bo'lishi kerak!", "danger")
-            return render_template('register.html'), 400
-
-        # 2. Unikallikni tekshirish (Unique check)
-        existing_username = User.query.filter_by(username=username).first()
-        if existing_username:
-            flash("Bu username allaqachon band!", "danger")
-            return render_template('register.html'), 400
-
-        existing_email = User.query.filter_by(email=email).first()
-        if existing_email:
-            flash("Bu email bilan allaqachon ro'yxatdan o'tilgan!", "danger")
-            return render_template('register.html'), 400
-
-        # 3. Yangi foydalanuvchini yaratish
-        new_user = User(username=username, email=email)
-        new_user.set_password(password) # Parol xeshlanadi
+            # ?next=... parametrini tekshirish (Xavfsiz yo'naltirish bilan)
+            next_page = request.args.get('next')
+            if not next_page or urlparse(next_page).netloc != '':
+                next_page = url_for('main.index') # default sahifa
+                
+            flash("Tizimga muvaffaqiyatli kirdingiz!", "success")
+            return redirect(next_page)
         
-        db.session.add(new_user)
-        db.session.commit()
+        flash("Logindagi ma'lumotlar xato!", "danger")
+        
+    return render_template('login.html')
 
-        flash("Ro'yxatdan muvaffaqiyatli o'tdingiz!", "success")
-        return redirect(url_for('auth.register'))
-
-    # GET so'rovi bo'lganda formani qaytaradi
-    return render_template('register.html')
-4. Flask Shell orqali test qilish
-Tizim to'g'ri ishlayotganini tekshirish uchun terminalda flask shellni ochamiz va quyidagi kodlarni bajarib ko'ramiz:
+@auth.route('/auth/logout')
+@login_required # Faqat login bo'lganlar chiqa oladi
+def logout():
+    logout_user()
+    flash("Tizimdan chiqdingiz.", "info")
+    return redirect(url_for('main.index'))
+3. Yangi Item yaratish (items.py)
+Element yaratilganda avtomatik ravishda uni joriy login bo'lgan foydalanuvchiga bog'laymiz:
 
 Python
-# Flask shell muhitida:
->>> from models import User, db
+from flask import Blueprint, render_template, request, redirect, url_for, flash
+from flask_login import login_required, current_user
+from models import Item, db
 
-# 1. Bazadagi birinchi foydalanuvchini olamiz
->>> user = User.query.first()
->>> print(user.username)
-'shaxzod'
+items_bp = Blueprint('items', __name__)
 
-# 2. Noto'g'ri parol bilan tekshiramiz (False qaytishi kerak)
->>> user.check_password('noto_g_ri_parol')
-False
+@items_bp.route('/items/new', methods=['GET', 'POST'])
+@login_required # Faqat login bo'lgan foydalanuvchilar kiradi
+def new_item():
+    if request.method == 'POST':
+        item_name = request.form.get('name', '').strip()
+        
+        if not item_name:
+            flash("Item nomi bo'sh bo'lishi mumkin emas!", "danger")
+            return render_template('new_item.html')
 
-# 3. To'g'ri parol bilan tekshiramiz (True qaytishi kerak)
->>> user.check_password('my_secret_password123')
-True
+        # Yangi item yaratish va joriy foydalanuvchi ID sini biriktirish
+        item = Item(name=item_name, user_id=current_user.id)
+        
+        db.session.add(item)
+        db.session.commit()
+        
+        flash("Yangi element muvaffaqiyatli qo'shildi!", "success")
+        return redirect(url_for('main.index'))
+
+    return render_template('new_item.html')
+4. Bosh menyu (Shablon - base.html)
+Jinjada current_user.is_authenticated orqali menyuni dinamik o'zgartiramiz:
+
+HTML
+<nav class="navbar navbar-expand-lg navbar-light bg-light">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="/">Mening Saytim</a>
+    <div class="collapse navbar-collapse">
+      <ul class="navbar-nav ms-auto mb-2 mb-lg-0">
+        
+        {% if current_user.is_authenticated %}
+          <li class="nav-item">
+            <span class="nav-link text-dark">Salom, <strong>{{ current_user.username }}</strong>!</span>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="{{ url_for('items.new_item') }}">Yangi Item</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link btn btn-outline-danger btn-sm text-danger" href="{{ url_for('auth.logout') }}">Chiqish</a>
+          </li>
+        {% else %}
+          <li class="nav-item">
+            <a class="nav-link" href="{{ url_for('auth.login') }}">Kirish</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" href="{{ url_for('auth.register') }}">Ro'yxatdan o'tish</a>
+          </li>
+        {% endif %}
+        
+      </ul>
+    </div>
+  </div>
+</nav>
